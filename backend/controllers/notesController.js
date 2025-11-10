@@ -155,31 +155,38 @@ const getNotes = async (req, res) => {
 // Get single note
 const getNote = async (req, res) => {
   try {
-    const { incrementView } = req.query;
-    
-    const note = await Note.findById(req.params.id)
-      .populate('uploaderId', 'name email role');
+    const noteId = req.params.id;
+    const incrementView = req.query.incrementView === 'true';
+
+    const note = await Note.findById(noteId)
+      .populate('uploaderId', 'name email profilePicture')
+      .populate('subject');
 
     if (!note) {
       return res.status(404).json({ message: 'Note not found' });
     }
 
-    // Only increment view if explicitly requested (frontend will control this)
-    if (incrementView === 'true') {
+    // Increment views if requested and not already viewed
+    if (incrementView) {
       note.views += 1;
       await note.save();
     }
 
-    // Generate signed URL for preview
-    const signedUrl = await getSignedUrlForFile(note.fileKey, 3600);
+    // Generate preview URL from S3 or GridFS
+    let previewUrl = null;
+
+    if (note.fileId) {
+      // Use backend file route for GridFS
+      previewUrl = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/files/${note.fileId}`;
+    }
 
     res.json({
       note,
-      previewUrl: signedUrl
+      previewUrl
     });
   } catch (error) {
     console.error('Get note error:', error);
-    res.status(500).json({ message: 'Failed to fetch note' });
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 

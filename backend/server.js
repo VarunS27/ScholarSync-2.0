@@ -17,7 +17,12 @@ const filesRoutes = require('./routes/files');
 
 const app = express();
 
-app.use(helmet());
+// Helmet with relaxed COOP for Google OAuth and file previews
+app.use(helmet({
+  crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  crossOriginEmbedderPolicy: false // Allow embedding PDFs and files
+}));
 
 // CORS configuration for production
 const allowedOrigins = [
@@ -76,9 +81,10 @@ app.get('/api/health', (req, res) => {
   }); 
 });
 
-// 404 handler
+// 404 handler with better logging
 app.use((req, res) => { 
-  res.status(404).json({ message: 'Route not found' }); 
+  console.log('❌ 404 - Route not found:', req.method, req.path);
+  res.status(404).json({ message: 'Route not found', path: req.path }); 
 });
 
 // Error handler

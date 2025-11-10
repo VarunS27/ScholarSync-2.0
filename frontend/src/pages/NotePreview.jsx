@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { motion } from 'framer-motion';
 import { 
   FiHeart, FiDownload, FiEye, FiMessageCircle, FiShare2, 
-  FiUser, FiClock, FiTag, FiAlertCircle, FiThumbsDown 
+  FiUser, FiClock, FiTag, FiAlertCircle, FiThumbsDown, FiFileText
 } from 'react-icons/fi';
 import { format } from 'date-fns';
 import { notesAPI, reactionsAPI, commentsAPI } from '../utils/api';
@@ -239,13 +239,18 @@ const NotePreview = () => {
                 {previewUrl ? (
                   <iframe
                     src={previewUrl}
-                    className="w-full h-full"
-                    style={{ minHeight: '600px' }}
-                    title="Document Preview"
+                    className="w-full h-full border-0 rounded-lg"
+                    title="Note Preview"
+                    sandbox="allow-scripts allow-same-origin"
                   />
                 ) : (
-                  <div className="flex items-center justify-center h-full" style={{ minHeight: '600px' }}>
-                    <p className="text-gray-500 dark:text-gray-400">Preview not available</p>
+                  <div className="flex items-center justify-center h-full">
+                    <div className="text-center">
+                      <FiFileText className="w-16 h-16 mx-auto mb-4 text-gray-400" />
+                      <p className="text-gray-600 dark:text-gray-400">
+                        Preview not available for this file type
+                      </p>
+                    </div>
                   </div>
                 )}
               </div>
