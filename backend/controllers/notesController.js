@@ -1,158 +1,179 @@
-const multer = require('multer');
-const { body, validationResult } = require('express-validator');
 const Note = require('../models/Note');
-const User = require('../models/User');
-const { uploadToS3, deleteFromS3, getSignedUrlForFile } = require('../utils/s3Uploader');
+const Subject = require('../models/Subject');
+const multer = require('multer');
+const mongoose = require('mongoose');
+const { GridFSBucket } = require('mongodb');
 
-// Configure multer for memory storage
+// Multer configuration for memory storage
 const storage = multer.memoryStorage();
 
-const fileFilter = (req, file, cb) => {
-  const allowedTypes = [
-    'application/pdf',
-    'application/msword',
-    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    'application/vnd.ms-powerpoint',
-    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-    'image/jpeg',
-    'image/jpg',
-    'image/png',
-    'text/plain'
-  ];
-
-  if (allowedTypes.includes(file.mimetype)) {
-    cb(null, true);
-  } else {
-    cb(new Error('Invalid file type. Only PDF, DOCX, PPTX, JPG, JPEG, PNG, and TXT files are allowed'), false);
-  }
-};
-
 const upload = multer({
-  storage,
-  limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB
-  },
-  fileFilter,
+  storage: storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /pdf|doc|docx|ppt|pptx|txt/;
+    const extname = allowedTypes.test(file.originalname.split('.').pop().toLowerCase());
+    
+    if (extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Only PDF, DOC, DOCX, PPT, PPTX, and TXT files are allowed'));
+    }
+  }
 });
 
-// Validation rules
-const noteValidation = [
-  body('title').trim().notEmpty().withMessage('Title is required').isLength({ max: 200 }),
-  body('subject').trim().notEmpty().withMessage('Subject is required'),
-  body('description').optional().trim().isLength({ max: 1000 }),
-  body('allowDownload').optional().isBoolean()
-];
+// Validation middleware
+const noteValidation = (req, res, next) => {
+  const { title, subject } = req.body;
+  
+  if (!title || title.trim().length === 0) {
+    return res.status(400).json({ message: 'Title is required' });
+  }
+  
+  if (!subject || subject.trim().length === 0) {
+    return res.status(400).json({ message: 'Subject is required' });
+  }
+  
+  next();
+};
 
-// Upload note
+// Upload note with GridFS
 const uploadNote = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      console.log('Validation errors:', errors.array());
-      console.log('Request body:', req.body);
-      return res.status(400).json({ 
-        message: 'Validation failed',
-        errors: errors.array() 
-      });
-    }
-
     if (!req.file) {
-      return res.status(400).json({ message: 'File is required' });
+      return res.status(400).json({ message: 'No file uploaded' });
     }
 
-    const { title, subject, description, tags, allowDownload } = req.body;
+    const { title, description, subject, tags } = req.body;
 
-    // Upload file to S3
-    const { fileKey, fileUrl } = await uploadToS3(req.file);
+    console.log('📝 Upload request:', { title, subject, tags, fileName: req.file.originalname });
 
-    // Create note
-    const note = new Note({
-      title,
-      subject,
-      description,
-      tags: tags ? (Array.isArray(tags) ? tags : tags.split(',').map(t => t.trim())) : [],
-      uploaderId: req.user._id,
-      allowDownload: allowDownload === 'true' || allowDownload === true,
-      fileUrl,
-      fileKey,
-      fileType: req.file.mimetype,
-      fileSize: req.file.size
+    // Check if subject exists
+    const subjectExists = await Subject.findOne({ name: subject });
+    if (!subjectExists) {
+      return res.status(400).json({ message: 'Invalid subject' });
+    }
+
+    // Create GridFS bucket
+    const bucket = new GridFSBucket(mongoose.connection.db, {
+      bucketName: 'uploads'
     });
 
-    await note.save();
-
-    const populatedNote = await Note.findById(note._id)
-      .populate('uploaderId', 'name email');
-
-    res.status(201).json({
-      message: 'Note uploaded successfully',
-      note: populatedNote
+    // Create upload stream
+    const uploadStream = bucket.openUploadStream(req.file.originalname, {
+      contentType: req.file.mimetype,
+      metadata: {
+        uploaderId: req.user._id,
+        originalName: req.file.originalname,
+        uploadDate: new Date()
+      }
     });
+
+    // Write file buffer to GridFS
+    uploadStream.end(req.file.buffer);
+
+    uploadStream.on('finish', async () => {
+      try {
+        console.log('✅ File uploaded to GridFS:', uploadStream.id);
+
+        // Parse tags
+        let parsedTags = [];
+        if (tags) {
+          if (typeof tags === 'string') {
+            parsedTags = tags.split(',').map(tag => tag.trim()).filter(Boolean);
+          } else if (Array.isArray(tags)) {
+            parsedTags = tags;
+          }
+        }
+
+        // Create note document
+        const note = new Note({
+          title,
+          description: description || '',
+          subject,
+          tags: parsedTags,
+          uploaderId: req.user._id,
+          fileId: uploadStream.id.toString(),
+          fileName: req.file.originalname,
+          fileSize: req.file.size,
+          fileType: req.file.mimetype
+        });
+
+        await note.save();
+        console.log('✅ Note created:', note._id);
+
+        // Populate the note before sending response
+        await note.populate('uploaderId', 'name email profilePicture');
+        await note.populate('subject');
+
+        res.status(201).json({
+          message: 'Note uploaded successfully',
+          note
+        });
+      } catch (error) {
+        console.error('❌ Error creating note:', error);
+        // Clean up uploaded file if note creation fails
+        await bucket.delete(uploadStream.id);
+        res.status(500).json({ message: 'Error creating note', error: error.message });
+      }
+    });
+
+    uploadStream.on('error', (error) => {
+      console.error('❌ GridFS upload error:', error);
+      res.status(500).json({ message: 'Error uploading file', error: error.message });
+    });
+
   } catch (error) {
-    console.error('Upload note error:', error);
-    res.status(500).json({ message: error.message || 'Failed to upload note' });
+    console.error('❌ Upload note error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
-// Get all notes with filters
+// Get all notes with pagination
 const getNotes = async (req, res) => {
   try {
-    const { subject, query, sort = 'recent', page = 1, limit = 12 } = req.query;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 12;
+    const skip = (page - 1) * limit;
+    const search = req.query.search || '';
+    const subject = req.query.subject || '';
 
-    const filter = {};
-    
-    if (subject && subject !== 'all') {
-      filter.subject = subject;
-    }
+    let query = {};
 
-    if (query) {
-      filter.$or = [
-        { title: { $regex: query, $options: 'i' } },
-        { description: { $regex: query, $options: 'i' } },
-        { tags: { $regex: query, $options: 'i' } }
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+        { tags: { $regex: search, $options: 'i' } }
       ];
     }
 
-    let sortOption = {};
-    switch (sort) {
-      case 'recent':
-        sortOption = { createdAt: -1 };
-        break;
-      case 'popular':
-        sortOption = { views: -1 };
-        break;
-      case 'liked':
-        sortOption = { likes: -1 };
-        break;
-      default:
-        sortOption = { createdAt: -1 };
+    if (subject) {
+      query.subject = subject;
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    const notes = await Note.find(filter)
-      .populate('uploaderId', 'name email')
-      .sort(sortOption)
+    const notes = await Note.find(query)
+      .populate('uploaderId', 'name email profilePicture')
+      .populate('subject')
+      .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(limit);
 
-    const total = await Note.countDocuments(filter);
+    const total = await Note.countDocuments(query);
 
     res.json({
       notes,
-      pagination: {
-        total,
-        page: parseInt(page),
-        pages: Math.ceil(total / parseInt(limit))
-      }
+      totalPages: Math.ceil(total / limit),
+      currentPage: page,
+      totalNotes: total
     });
   } catch (error) {
-    console.error('Get notes error:', error);
-    res.status(500).json({ message: 'Failed to fetch notes' });
+    console.error('❌ Get notes error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
-// Get single note
+// Get single note with preview URL
 const getNote = async (req, res) => {
   try {
     const noteId = req.params.id;
@@ -166,26 +187,24 @@ const getNote = async (req, res) => {
       return res.status(404).json({ message: 'Note not found' });
     }
 
-    // Increment views if requested and not already viewed
+    // Increment views
     if (incrementView) {
       note.views += 1;
       await note.save();
     }
 
-    // Generate preview URL from S3 or GridFS
-    let previewUrl = null;
+    // Generate preview URL (GridFS route)
+    const backendUrl = process.env.BACKEND_URL || 'https://scholarsync-2-0.onrender.com';
+    const previewUrl = `${backendUrl}/api/files/${note.fileId}`;
 
-    if (note.fileId) {
-      // Use backend file route for GridFS
-      previewUrl = `${process.env.BACKEND_URL || 'http://localhost:5000'}/api/files/${note.fileId}`;
-    }
+    console.log('📄 Serving note:', { noteId, fileId: note.fileId, previewUrl });
 
     res.json({
       note,
       previewUrl
     });
   } catch (error) {
-    console.error('Get note error:', error);
+    console.error('❌ Get note error:', error);
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
@@ -193,46 +212,40 @@ const getNote = async (req, res) => {
 // Update note
 const updateNote = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
+    const { title, description, subject, tags } = req.body;
     const note = await Note.findById(req.params.id);
 
     if (!note) {
       return res.status(404).json({ message: 'Note not found' });
     }
 
-    // Check ownership or admin
-    if (note.uploaderId.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    // Check if user is the uploader
+    if (note.uploaderId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: 'Not authorized to update this note' });
     }
 
-    const { title, subject, description, tags, allowDownload } = req.body;
-
+    // Update fields
     if (title) note.title = title;
+    if (description !== undefined) note.description = description;
     if (subject) note.subject = subject;
-    if (description) note.description = description;
-    if (tags) note.tags = Array.isArray(tags) ? tags : tags.split(',').map(t => t.trim());
-    if (allowDownload !== undefined) note.allowDownload = allowDownload === 'true' || allowDownload === true;
+    if (tags) {
+      note.tags = typeof tags === 'string' 
+        ? tags.split(',').map(tag => tag.trim()).filter(Boolean)
+        : tags;
+    }
 
     await note.save();
+    await note.populate('uploaderId', 'name email profilePicture');
+    await note.populate('subject');
 
-    const updatedNote = await Note.findById(note._id)
-      .populate('uploaderId', 'name email');
-
-    res.json({
-      message: 'Note updated successfully',
-      note: updatedNote
-    });
+    res.json({ message: 'Note updated successfully', note });
   } catch (error) {
-    console.error('Update note error:', error);
-    res.status(500).json({ message: 'Failed to update note' });
+    console.error('❌ Update note error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
-// Delete note
+// Delete note and file
 const deleteNote = async (req, res) => {
   try {
     const note = await Note.findById(req.params.id);
@@ -241,21 +254,30 @@ const deleteNote = async (req, res) => {
       return res.status(404).json({ message: 'Note not found' });
     }
 
-    // Check ownership or admin
-    if (note.uploaderId.toString() !== req.user._id.toString() && req.user.role !== 'admin') {
+    // Check if user is the uploader or admin
+    if (note.uploaderId.toString() !== req.user._id.toString() && !req.user.isAdmin) {
       return res.status(403).json({ message: 'Not authorized to delete this note' });
     }
 
-    // Delete from S3
-    await deleteFromS3(note.fileKey);
+    // Delete file from GridFS
+    const bucket = new GridFSBucket(mongoose.connection.db, {
+      bucketName: 'uploads'
+    });
+
+    try {
+      await bucket.delete(new mongoose.Types.ObjectId(note.fileId));
+      console.log('✅ File deleted from GridFS:', note.fileId);
+    } catch (error) {
+      console.error('⚠️ Error deleting file from GridFS:', error);
+    }
 
     // Delete note
-    await Note.findByIdAndDelete(req.params.id);
+    await note.deleteOne();
 
     res.json({ message: 'Note deleted successfully' });
   } catch (error) {
-    console.error('Delete note error:', error);
-    res.status(500).json({ message: 'Failed to delete note' });
+    console.error('❌ Delete note error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -263,25 +285,21 @@ const deleteNote = async (req, res) => {
 const getDownloadUrl = async (req, res) => {
   try {
     const note = await Note.findById(req.params.id);
-
+    
     if (!note) {
       return res.status(404).json({ message: 'Note not found' });
     }
 
-    if (!note.allowDownload) {
-      return res.status(403).json({ message: 'Download not allowed for this note' });
-    }
-
-    // Generate signed URL for download
-    const downloadUrl = await getSignedUrlForFile(note.fileKey, 300); // 5 minutes
+    const backendUrl = process.env.BACKEND_URL || 'https://scholarsync-2-0.onrender.com';
+    const downloadUrl = `${backendUrl}/api/files/${note.fileId}/download`;
 
     res.json({
       downloadUrl,
-      filename: note.title
+      filename: note.fileName
     });
   } catch (error) {
-    console.error('Get download URL error:', error);
-    res.status(500).json({ message: 'Failed to generate download URL' });
+    console.error('❌ Get download URL error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
@@ -289,13 +307,13 @@ const getDownloadUrl = async (req, res) => {
 const getMyNotes = async (req, res) => {
   try {
     const notes = await Note.find({ uploaderId: req.user._id })
-      .sort({ createdAt: -1 })
-      .populate('uploaderId', 'name email');
+      .populate('subject')
+      .sort({ createdAt: -1 });
 
     res.json({ notes });
   } catch (error) {
-    console.error('Get my notes error:', error);
-    res.status(500).json({ message: 'Failed to fetch your notes' });
+    console.error('❌ Get my notes error:', error);
+    res.status(500).json({ message: 'Server error', error: error.message });
   }
 };
 
